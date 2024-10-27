@@ -1,3 +1,31 @@
+(function() {
+// Find the script tag that loaded this script
+var scripts = document.getElementsByTagName('script');
+var currentScript;
+for (var i = 0; i < scripts.length; i++) {
+  if (scripts[i].src && scripts[i].src.includes('tracking.js')) {
+    currentScript = scripts[i];
+    break;
+  }
+}
+
+if (!currentScript) {
+  console.error('Tracking script tag not found.');
+  return;
+}
+
+// Access the API key from data attributes
+var apiKey = currentScript.getAttribute('data-apikey');
+
+if (!apiKey) {
+  console.error('API key is missing. Please provide your API key in the script tag.');
+  return;
+}
+
+// Store the API key globally so it can be used in other functions
+window.myTrackingApiKey = apiKey;
+
+// Actual Script
 <script>
 (function() {
   console.log("Script started");
@@ -265,6 +293,8 @@
 
   // Enhanced sendTrackingData to support PATCH
   async function sendTrackingData(eventData, table, method = 'POST') {
+      // Include the API key
+  eventData.api_key = window.myTrackingApiKey;
     try {
       const endpoint = `https://lwyxvzvyvpqhuocfcbwd.supabase.co/rest/v1/${table}`;
       const url = method === 'PATCH' ? `${endpoint}?id=eq.${eventData.id}` : `${endpoint}?select=id`;
@@ -707,3 +737,5 @@ function detectFormType(form) {
   console.log("Script finished setup");
 })();
 </script>
+})();
+
