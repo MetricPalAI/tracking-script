@@ -1,31 +1,3 @@
-(function() {
-// Find the script tag that loaded this script
-var scripts = document.getElementsByTagName('script');
-var currentScript;
-for (var i = 0; i < scripts.length; i++) {
-  if (scripts[i].src && scripts[i].src.includes('tracking.js')) {
-    currentScript = scripts[i];
-    break;
-  }
-}
-
-if (!currentScript) {
-  console.error('Tracking script tag not found.');
-  return;
-}
-
-// Access the API key from data attributes
-var apiKey = currentScript.getAttribute('data-apikey');
-
-if (!apiKey) {
-  console.error('API key is missing. Please provide your API key in the script tag.');
-  return;
-}
-
-// Store the API key globally so it can be used in other functions
-window.myTrackingApiKey = apiKey;
-
-// Actual Script
 <script>
 (function() {
   console.log("Script started");
@@ -33,13 +5,58 @@ window.myTrackingApiKey = apiKey;
   let sessionNumericId = 1;
   let pageStartTime = new Date();
   let maxScrollDepth = 0;
+  let inactivityInterval;
+  let inactivityTimeout = 10; // Max inactive minutes before ending session
+  let isSessionEnding = false;
+  let lastActivityTime = new Date();
+  let activeTabTime = 0;
+  let isTabActive = true;
+  let tabSwitchCount = 0;
+  let inactivityPeriods = [];
+
+
 
   // Add these helper functions at the top of your script
+  const eventQueue = [];
+  const MAX_QUEUE_SIZE = 10; // Send after 10 events
+  const QUEUE_TIMEOUT = 5000; // Or after 5 seconds
+  let queueTimeout;
+
+
+
+  // Add queue processor
+  const processQueue = async () => {
+    if (eventQueue.length === 0) return;
+    
+    const events = [...eventQueue];
+    eventQueue.length = 0; // Clear queue
+    
+    try {
+      await sendTrackingData(events, 'events');
+      console.log(`Processed ${events.length} events from queue`);
+    } catch (error) {
+      console.error('Error processing queue:', error);
+      // On error, put events back in queue
+      eventQueue.push(...events);
+    }
+  };
   const COMMON_EMAIL_PROVIDERS = [
     'gmail.com', 'yahoo.com', 'hotmail.com', 'outlook.com', 
     'aol.com', 'icloud.com', 'protonmail.com', 'mail.com'
   ];
-
+  
+  function detectFormType(form) {
+    const formHtml = form.outerHTML.toLowerCase();
+    
+    if (formHtml.includes('contact') || form.id?.toLowerCase().includes('contact')) {
+        return 'contact';
+    } else if (formHtml.includes('subscribe') || formHtml.includes('newsletter')) {
+        return 'newsletter';
+    } else if (formHtml.includes('demo') || formHtml.includes('trial')) {
+        return 'demo';
+    }
+    return 'other';
+}
   function extractDomain(email) {
     if (!email) return null;
     return email.split('@')[1]?.toLowerCase();
@@ -233,6 +250,83 @@ window.myTrackingApiKey = apiKey;
     return Math.floor(Math.random() * 1000000000);
   }
 
+// Helper: Ehanced session tracking with acitvity and tab switch
+function setupEnhancedSessionTracking() {
+  let tabSwitchCount = 0;
+  let inactivityPeriods = [];
+
+  // Modify the existing visibility change listener
+  document.addEventListener('visibilitychange', () => {
+      isTabActive = document.visibilityState === 'visible';
+      if (isTabActive) {
+          lastActivityTime = new Date();
+          if (isSessionEnding) {
+              isSessionEnding = false;
+              console.log('Session restored due to user activity');
+          }
+          // Add this: Record end of inactivity period
+          if (inactivityPeriods.length > 0) {
+              const lastPeriod = inactivityPeriods[inactivityPeriods.length - 1];
+              if (!lastPeriod.end) {
+                  lastPeriod.end = new Date().toISOString();
+                  lastPeriod.duration = (new Date() - new Date(lastPeriod.start)) / 1000;
+              }
+          }
+      } else {
+          // Add this: Track tab switch and inactivity start
+          tabSwitchCount++;
+          inactivityPeriods.push({
+              start: new Date().toISOString()
+          });
+      }
+  });
+
+  // Keep your existing activity tracking
+  const activityEvents = ['mousedown', 'keydown', 'scroll', 'touchstart'];
+  activityEvents.forEach(eventType => {
+      document.addEventListener(eventType, () => {
+          lastActivityTime = new Date();
+          if (isSessionEnding) {
+              isSessionEnding = false;
+              console.log('Session restored due to user activity');
+          }
+          // Add this: Track the event type in our events
+          trackEvent('user_activity', null, null, {
+              eventType: eventType,
+              activeTabTime: activeTabTime,
+              tabSwitches: tabSwitchCount
+          });
+      });
+  });
+
+  // Modify your inactivity check
+  inactivityInterval = setInterval(() => {
+      if (!isTabActive) return;
+      
+      const inactiveTime = (new Date() - lastActivityTime) / 1000 / 60; // in minutes
+      if (inactiveTime >= inactivityTimeout && !isSessionEnding) {
+          isSessionEnding = true;
+          trackEvent('session_inactive', null, null, {
+              inactiveTime: inactiveTime,
+              inactivityPeriods: inactivityPeriods,
+              tabSwitches: tabSwitchCount,
+              totalActiveTime: activeTabTime
+          });
+      }
+      
+      if (isTabActive) {
+          activeTabTime = (new Date() - pageStartTime) / 1000;
+          trackEvent('time_on_page', null, null, {
+              seconds: activeTabTime,
+              isActive: true,
+              inactivityPeriods: inactivityPeriods.length,
+              tabSwitches: tabSwitchCount,
+              lastActivityMinutes: (new Date() - lastActivityTime) / 1000 / 60
+          });
+      }
+  }, 60000);
+}
+
   // Enhanced fingerprint generation
   function generateFingerprint() {
     const components = {
@@ -291,15 +385,47 @@ window.myTrackingApiKey = apiKey;
     return null;
   }
 
-  // Enhanced sendTrackingData to support PATCH
-  async function sendTrackingData(eventData, table, method = 'POST') {
-      // Include the API key
-  eventData.api_key = window.myTrackingApiKey;
+  // Add these constants at the top with other configs
+  const MAX_RETRIES = 3;
+  const RETRY_DELAY = 1000; // 1 second
+  const DEBUG_MODE = window.location.search.includes('hsdebug=true');
+
+  // Add this error logging function
+  async function logError(error, metadata = {}) {
+    const errorData = {
+      error_message: error.message,
+      error_stack: error.stack,
+      error_timestamp: new Date().toISOString(),
+      page_url: window.location.href,
+      session_id: sessionStorage.getItem('mp_session_numeric_id'),
+      visitor_id: sessionStorage.getItem('mp_visitor_id'),
+      metadata: JSON.stringify({
+        ...metadata,
+        userAgent: navigator.userAgent,
+        timestamp: new Date().toISOString()
+      })
+    };
+
+    try {
+      await sendTrackingData(errorData, 'events', 'POST');
+      DEBUG_MODE && console.log('Error logged:', errorData);
+    } catch (e) {
+      console.error('Failed to log error:', e);
+      // Store failed error logs for retry
+      const failedLogs = JSON.parse(localStorage.getItem('failed_error_logs') || '[]');
+      failedLogs.push(errorData);
+      localStorage.setItem('failed_error_logs', JSON.stringify(failedLogs));
+    }
+  }
+
+  // Add retry mechanism to sendTrackingData
+  async function sendTrackingData(eventData, table, method = 'POST', retryCount = 0) {
     try {
       const endpoint = `https://lwyxvzvyvpqhuocfcbwd.supabase.co/rest/v1/${table}`;
       const url = method === 'PATCH' ? `${endpoint}?id=eq.${eventData.id}` : `${endpoint}?select=id`;
       
-      console.log(`Attempting to send data to ${table}:`, eventData);
+      DEBUG_MODE && console.log(`Attempting to send data to ${table}:`, eventData);
+      
       const response = await fetch(url, {
         method: method,
         headers: {
@@ -308,19 +434,44 @@ window.myTrackingApiKey = apiKey;
           'apikey': 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imx3eXh2enZ5dnBxaHVvY2ZjYndkIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Mjc1MTUwNTYsImV4cCI6MjA0MzA5MTA1Nn0.WYwNg-BHhIdbj7pcCuBnqc8-c9NU5sR8hPQLDlGY9RY',
           'Prefer': 'return=representation'
         },
-        body: JSON.stringify(eventData)
+        body: JSON.stringify(Array.isArray(eventData) ? eventData : [eventData])
       });
 
       if (!response.ok) {
-        const errorText = await response.text();
-        throw new Error(`HTTP error! status: ${response.status}, body: ${errorText}`);
+        throw new Error(`HTTP error! status: ${response.status}`);
       }
       
       const data = await response.json();
-      console.log(`Successfully sent data to ${table}:`, data);
+      DEBUG_MODE && console.log(`Successfully sent data to ${table}:`, data);
       return data;
     } catch (error) {
-      console.error(`Failed to send data to ${table}:`, error);
+      DEBUG_MODE && console.error(`Failed to send data to ${table}:`, error);
+      
+      // Handle retry logic
+      if (retryCount < MAX_RETRIES) {
+        await new Promise(resolve => setTimeout(resolve, RETRY_DELAY * (retryCount + 1)));
+        return sendTrackingData(eventData, table, method, retryCount + 1);
+      }
+
+      // If all retries failed, store for later retry
+      const failedEvents = JSON.parse(localStorage.getItem('failed_events') || '[]');
+      failedEvents.push({
+        eventData,
+        table,
+        method,
+        timestamp: new Date().toISOString()
+      });
+      localStorage.setItem('failed_events', JSON.stringify(failedEvents));
+      
+      // Log the error
+      await logError(error, {
+        operation: 'sendTrackingData',
+        table,
+        method,
+        retryCount,
+        eventData: JSON.stringify(eventData)
+      });
+
       return null;
     }
   }
@@ -351,160 +502,190 @@ window.myTrackingApiKey = apiKey;
   }
 
   // Enhanced form tracking with visitor identification
-function setupFormTracking() {
-  document.addEventListener('submit', async function(e) {
-    const form = e.target;
-    
-    // Find email field
-    const emailField = Array.from(form.elements).find(el => 
-      el.type === 'email' || 
-      el.name?.toLowerCase().includes('email') ||
-      el.id?.toLowerCase().includes('email')
-    );
+  function setupFormTracking() {
+    document.addEventListener('submit', async function(e) {
+      const form = e.target;
+      
+      // Find email field
+      const emailField = Array.from(form.elements).find(el => 
+        el.type === 'email' || 
+        el.name?.toLowerCase().includes('email') ||
+        el.id?.toLowerCase().includes('email')
+      );
 
-    // Find company name field
-    const companyField = Array.from(form.elements).find(el =>
-      el.name?.toLowerCase().includes('company') ||
-      el.name?.toLowerCase().includes('organization') ||
-      el.id?.toLowerCase().includes('company') ||
-      el.id?.toLowerCase().includes('organization')
-    );
+      // Find company name field
+      const companyField = Array.from(form.elements).find(el =>
+        el.name?.toLowerCase().includes('company') ||
+        el.name?.toLowerCase().includes('organization') ||
+        el.id?.toLowerCase().includes('company') ||
+        el.id?.toLowerCase().includes('organization')
+      );
 
-    const email = emailField?.value?.trim();
-    const companyName = companyField?.value?.trim();
-    
-    // Extract email domain and check if business email
-    let emailDomain = null;
-    let isBusinessEmail = false;
-    
-    if (email) {
-      emailDomain = email.split('@')[1]?.toLowerCase();
-      // Exclude common personal email domains
-      const personalDomains = ['gmail.com', 'yahoo.com', 'hotmail.com', 'outlook.com', 'aol.com'];
-      isBusinessEmail = emailDomain && !personalDomains.includes(emailDomain);
-    }
-
-    // Get current visitor ID
-    const visitorId = sessionStorage.getItem('mp_visitor_id');
-    
-    if (email && visitorId) {
-      // Update visitor record with identification
-      const visitorData = {
-        id: visitorId,
-        email: email,
-        email_domain: emailDomain,
-        is_identified: true,
-        identification_date: new Date().toISOString(),
-        identification_source: 'form_submission',
-        updated_at: new Date().toISOString()
-      };
-
-      try {
-        await sendTrackingData(visitorData, 'visitors', 'PATCH');
-        console.log('Visitor identified:', visitorId);
-
-        // If business email, handle company identification
-        if (isBusinessEmail) {
-          await handleCompanyIdentification(emailDomain, companyName, visitorId, email);
-        }
-      } catch (error) {
-        console.error('Error identifying visitor:', error);
+      const email = emailField?.value?.trim();
+      const companyName = companyField?.value?.trim();
+      
+      // Extract email domain and check if business email
+      let emailDomain = null;
+      let isBusinessEmail = false;
+      
+      if (email) {
+        emailDomain = email.split('@')[1]?.toLowerCase();
+        // Exclude common personal email domains
+        const personalDomains = ['gmail.com', 'yahoo.com', 'hotmail.com', 'outlook.com', 'aol.com'];
+        isBusinessEmail = emailDomain && !personalDomains.includes(emailDomain);
       }
-    }
 
-    // Track form submission
-    const formData = {
-      session_id: parseInt(sessionStorage.getItem('mp_session_numeric_id')),
-      visitor_id: visitorId,
-      form_id: form.id || null,
-      form_name: form.getAttribute('name') || null,
-      form_action: form.action,
-      page_url: window.location.href,
-      email_domain: emailDomain,
-      email: email,
-      is_business_email: isBusinessEmail,
-      form_fields: JSON.stringify({
-        has_company_field: !!companyField,
-        has_email_field: !!emailField,
-        company_name: companyName || null
-      }),
-      metadata: JSON.stringify({
-        form_type: detectFormType(form),
-        field_count: form.elements.length,
-        has_required_fields: Array.from(form.elements).some(el => el.required)
-      })
-    };
+      // Get current visitor ID
+      const visitorId = sessionStorage.getItem('mp_visitor_id');
+      
+      if (email && visitorId) {
+        // Update visitor record with identification
+        const visitorData = {
+          id: visitorId,
+          email: email,
+          email_domain: emailDomain,
+          is_identified: true,
+          identification_date: new Date().toISOString(),
+          identification_source: 'form_submission',
+          updated_at: new Date().toISOString()
+        };
 
-    try {
-      await sendTrackingData(formData, 'form_submissions');
-    } catch (error) {
-      console.error('Error tracking form submission:', error);
-    }
-  });
-}
+        try {
+          await sendTrackingData(visitorData, 'visitors', 'PATCH');
+          console.log('Visitor identified:', visitorId);
 
-// Enhanced company identification handling
-async function handleCompanyIdentification(domain, companyName, visitorId, email) {
-  try {
-    // Try to find existing company
-    const existingCompany = await findCompany(domain);
-    
-    if (existingCompany) {
-      // Update existing company
-      await sendTrackingData({
-        id: existingCompany.id,
-        last_enrichment_at: new Date().toISOString(),
-        updated_at: new Date().toISOString()
-      }, 'companies', 'PATCH');
+          // If business email, handle company identification
+          if (isBusinessEmail) {
+            await handleCompanyIdentification(emailDomain, companyName, visitorId, email);
+          }
+        } catch (error) {
+          console.error('Error identifying visitor:', error);
+        }
+      }
 
-      // Update visitor with company association
-      await sendTrackingData({
-        id: visitorId,
-        company_id: existingCompany.id,
-        updated_at: new Date().toISOString()
-      }, 'visitors', 'PATCH');
-    } else {
-      // Create new company
-      const companyData = {
-        domain: domain,
-        name: companyName || domain.split('.')[0],
-        identified_via: 'form_submission',
-        identified_at: new Date().toISOString(),
-        status: 'identified',
-        company_data: JSON.stringify({
-          first_visitor_id: visitorId,
-          first_seen_email: email
+      // Track form submission
+      const formData = {
+        session_id: parseInt(sessionStorage.getItem('mp_session_numeric_id')),
+        visitor_id: visitorId,
+        form_id: form.id || null,
+        form_name: form.getAttribute('name') || null,
+        form_action: form.action,
+        page_url: window.location.href,
+        email_domain: emailDomain,
+        email: email,
+        is_business_email: isBusinessEmail,
+        form_fields: JSON.stringify({
+          has_company_field: !!companyField,
+          has_email_field: !!emailField,
+          company_name: companyName || null
+        }),
+        metadata: JSON.stringify({
+          form_type: detectFormType(form),
+          field_count: form.elements.length,
+          has_required_fields: Array.from(form.elements).some(el => el.required)
         })
       };
 
-      const newCompany = await sendTrackingData(companyData, 'companies');
-      if (newCompany?.[0]?.id) {
-        // Link visitor to new company
+      try {
+        await sendTrackingData(formData, 'form_submissions');
+        
+        // Track form completion event
+        trackEvent('form_complete', 'FORM', form.id, {
+          formType: detectFormType(form),
+          hasEmail: !!emailField,
+          hasCompany: !!companyField,
+          isBusinessEmail: isBusinessEmail
+        });
+      } catch (error) {
+        console.error('Error tracking form submission:', error);
+      }
+    });
+
+    // Add live form field tracking
+    document.addEventListener('change', function(e) {
+      const field = e.target;
+      if (field.form) {
+        trackEvent('form_field_complete', field.tagName, field.id, {
+          fieldType: field.type,
+          fieldName: field.name,
+          isRequired: field.required,
+          formId: field.form.id,
+          formType: detectFormType(field.form)
+        });
+      }
+    });
+  }
+
+  // Enhanced company identification handling
+  async function handleCompanyIdentification(domain, companyName, visitorId, email) {
+    try {
+      // Try to find existing company
+      const existingCompany = await findCompany(domain);
+      
+      if (existingCompany) {
+        // Update existing company
+        await sendTrackingData({
+          id: existingCompany.id,
+          last_enrichment_at: new Date().toISOString(),
+          updated_at: new Date().toISOString()
+        }, 'companies', 'PATCH');
+
+        // Update visitor with company association
         await sendTrackingData({
           id: visitorId,
-          company_id: newCompany[0].id,
+          company_id: existingCompany.id,
           updated_at: new Date().toISOString()
         }, 'visitors', 'PATCH');
-      }
-    }
-  } catch (error) {
-    console.error('Error handling company identification:', error);
-  }
-}
+      } else {
+        // Create new company
+        const companyData = {
+          domain: domain,
+          name: companyName || domain.split('.')[0],
+          identified_via: 'form_submission',
+          identified_at: new Date().toISOString(),
+          status: 'identified',
+          company_data: JSON.stringify({
+            first_visitor_id: visitorId,
+            first_seen_email: email
+          })
+        };
 
-// Helper function to detect form type
-function detectFormType(form) {
-  const formHtml = form.outerHTML.toLowerCase();
-  
-  if (formHtml.includes('contact') || form.id?.toLowerCase().includes('contact')) {
-    return 'contact';
-  } else if (formHtml.includes('subscribe') || formHtml.includes('newsletter')) {
-    return 'newsletter';
-  } else if (formHtml.includes('demo') || formHtml.includes('trial')) {
-    return 'demo';
+        const newCompany = await sendTrackingData(companyData, 'companies');
+        if (newCompany?.[0]?.id) {
+          // Link visitor to new company
+          await sendTrackingData({
+            id: visitorId,
+            company_id: newCompany[0].id,
+            updated_at: new Date().toISOString()
+          }, 'visitors', 'PATCH');
+        }
+      }
+    } catch (error) {
+      console.error('Error handling company identification:', error);
+    }
   }
-  return 'other';
-}
+
+  // Add this after your handleCompanyIdentification function
+  function detectSearchForm(form) {
+    // Check if it's a search form
+    const isSearchForm = form.querySelector('input[type="search"]') ||
+      form.querySelector('button[type="search"]') ||
+      form.getAttribute('role') === 'search' ||
+      form.classList.contains('search') ||
+      form.id.toLowerCase().includes('search');
+
+    if (isSearchForm) {
+      const searchInput = form.querySelector('input[type="search"]') || 
+        form.querySelector('input[type="text"]');
+      
+      return {
+        isSearch: true,
+        searchTerm: searchInput?.value || null
+      };
+    }
+
+    return { isSearch: false };
+  }
 
   // Track file downloads
   function setupDownloadTracking() {
@@ -563,7 +744,15 @@ function detectFormType(form) {
       page_url: window.location.href,
       element_type: elementType,
       element_id: elementId,
-      other_data: JSON.stringify(additionalData)
+      other_data: JSON.stringify({
+      ...additionalData,
+      tab_active: isTabActive,
+      time_since_last_activity: lastActivityTime ? 
+          (new Date() - lastActivityTime) / 1000 : 0,
+      active_tab_time: activeTabTime,
+      session_ending: isSessionEnding
+    })
+
     };
     sendTrackingData(eventData, 'events');
   }
@@ -597,6 +786,53 @@ function detectFormType(form) {
       });
     }, 30000);
   }
+
+  // Add recovery mechanism for failed events
+  function setupFailedEventRecovery() {
+    // Try to resend failed events every minute when online
+    setInterval(async () => {
+      if (!navigator.onLine) return;
+
+      // Attempt to resend failed error logs
+      const failedLogs = JSON.parse(localStorage.getItem('failed_error_logs') || '[]');
+      if (failedLogs.length > 0) {
+        const successfulLogs = [];
+        for (const log of failedLogs) {
+          try {
+            await sendTrackingData(log, 'events', 'POST');
+            successfulLogs.push(log);
+          } catch (e) {
+            console.error('Failed to resend error log:', e);
+          }
+        }
+        // Remove successful logs from storage
+        localStorage.setItem('failed_error_logs', 
+          JSON.stringify(failedLogs.filter(log => !successfulLogs.includes(log)))
+        );
+      }
+
+      // Attempt to resend failed events
+      const failedEvents = JSON.parse(localStorage.getItem('failed_events') || '[]');
+      if (failedEvents.length > 0) {
+        const successfulEvents = [];
+        for (const event of failedEvents) {
+          try {
+            await sendTrackingData(event.eventData, event.table, event.method);
+            successfulEvents.push(event);
+          } catch (e) {
+            console.error('Failed to resend event:', e);
+          }
+        }
+        // Remove successful events from storage
+        localStorage.setItem('failed_events', 
+          JSON.stringify(failedEvents.filter(event => !successfulEvents.includes(event)))
+        );
+      }
+    }, 60000);
+  }
+
+  // Add this to your startTracking function
+  setupFailedEventRecovery();
 
   // Main tracking logic - Updated to include UTM tracking
   async function startTracking() {
@@ -681,6 +917,7 @@ function detectFormType(form) {
       setupDownloadTracking();
       setupVideoTracking();
       setupScrollTracking();
+      setupEnhancedSessionTracking(); // Add this line here
       setupTimeOnPageTracking();
 
       // Track clicks
@@ -693,38 +930,44 @@ function detectFormType(form) {
       });
 
 
-      // Track session end
-      window.addEventListener('beforeunload', function () {
-        console.log('Session ending, tracking session end data...');
-        const sessionEndData = {
+     // Track session end
+    window.addEventListener('beforeunload', function() {
+      console.log('Session ending, tracking session end data...');
+      const sessionEndData = {
           id: sessionUUID,
           session_end: new Date().toISOString(),
-          exit_page_url: window.location.href
-        };
-        
-        // Use sendBeacon for reliable end-of-session tracking
-        try {
+          exit_page_url: window.location.href,
+          other_data: JSON.stringify({
+              total_active_time: activeTabTime,
+              final_scroll_depth: maxScrollDepth,
+              tab_switches: tabSwitchCount,
+              last_active: lastActivityTime.toISOString(),
+              inactivity_periods: inactivityPeriods
+          })
+      };
+
+      try {
           navigator.sendBeacon(
-            'https://lwyxvzvyvpqhuocfcbwd.supabase.co/rest/v1/sessions',
-            JSON.stringify({
-              ...sessionEndData,
-              headers: {
-                'Content-Type': 'application/json',
-                'Authorization': 'Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imx3eXh2enZ5dnBxaHVvY2ZjYndkIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Mjc1MTUwNTYsImV4cCI6MjA0MzA5MTA1Nn0.WYwNg-BHhIdbj7pcCuBnqc8-c9NU5sR8hPQLDlGY9RY',
-                'apikey': 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imx3eXh2enZ5dnBxaHVvY2ZjYndkIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Mjc1MTUwNTYsImV4cCI6MjA0MzA5MTA1Nn0.WYwNg-BHhIdbj7pcCuBnqc8-c9NU5sR8hPQLDlGY9RY'
-              }
-            })
+              'https://lwyxvzvyvpqhuocfcbwd.supabase.co/rest/v1/sessions',
+              JSON.stringify({
+                  ...sessionEndData,
+                  headers: {
+                      'Content-Type': 'application/json',
+                      'Authorization': 'Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imx3eXh2enZ5dnBxaHVvY2ZjYndkIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Mjc1MTUwNTYsImV4cCI6MjA0MzA5MTA1Nn0.WYwNg-BHhIdbj7pcCuBnqc8-c9NU5sR8hPQLDlGY9RY',
+                      'apikey': 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imx3eXh2enZ5dnBxaHVvY2ZjYndkIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Mjc1MTUwNTYsImV4cCI6MjA0MzA5MTA1Nn0.WYwNg-BHhIdbj7pcCuBnqc8-c9NU5sR8hPQLDlGY9RY'
+                  }
+              })
           );
           console.log('Session end data successfully sent using sendBeacon.');
-        } catch (e) {
+      } catch (e) {
           console.error('Failed to send session end data using sendBeacon:', e);
-        }
+      }
 
-        // Track final scroll depth
-        trackEvent('final_scroll_depth', null, null, {
+      // Track final scroll depth
+      trackEvent('final_scroll_depth', null, null, {
           depth: maxScrollDepth
-        });
       });
+    }); // beforeunload listener end
 
       console.log('Tracking initialized with session:', sessionUUID);
     } catch (error) {
@@ -737,5 +980,4 @@ function detectFormType(form) {
   console.log("Script finished setup");
 })();
 </script>
-})();
 
